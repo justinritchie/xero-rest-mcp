@@ -1,0 +1,20 @@
+[project]
+name = "xero-rest-mcp"
+version = "0.1.0"
+description = "Sidecar MCP exposing Xero REST endpoints (bank transfers, batch payments, attachments, void/update) that the xero-cli wrapper can't reach. Piggybacks on the xero CLI's existing OAuth tokens — no new auth setup required."
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.5.0",
+    "httpx>=0.27.0",
+    "cryptography>=42.0.0",
+]
+
+[project.scripts]
+xero-rest-mcp = "xero_rest_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xero_rest_mcp"]
