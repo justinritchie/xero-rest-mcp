@@ -423,6 +423,12 @@ async def whoami(profile: str | None = None) -> dict:
             "bank_transactions_update",
             "bank_transactions_void",
             "invoices_void",
+            # Round 4 — _full variants that bypass the CLI's field-stripping bug
+            "invoices_create_full",
+            "invoices_update_full",
+            "credit_notes_create_full",
+            "quotes_create_full",
+            "bank_transactions_create_full",
         ],
     }
 
@@ -726,6 +732,205 @@ async def invoices_void(
     return await _api(
         "POST", f"/Invoices/{invoice_id}",
         profile=profile, json_body=body,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Payload normalization for *_full create/update tools
+# ---------------------------------------------------------------------------
+# Xero REST accepts MOST camelCase fields directly (Type, Date, DueDate,
+# CurrencyCode, Status, LineItems, etc.) but a few require nested PascalCase
+# objects for ID references — flat `contactId` is rejected as "A Contact
+# must be specified". We normalize the most common flat-form ID refs into
+# their nested REST shape so callers can use the same camelCase keys they
+# pass to the xero-cli wrapper.
+
+def _normalize_xero_payload(data: dict) -> dict:
+    """Convert common flat ID refs to Xero REST's nested form. Idempotent —
+    leaves already-nested PascalCase fields untouched.
+
+    Rewrites these flat keys → nested objects:
+      contactId         → Contact: {ContactID: <uuid>}
+      bankAccountId     → BankAccount: {AccountID: <uuid>}
+      lineItems[].accountId → AccountID inside the line item (rare; AccountCode
+                              is preferred but Xero accepts AccountID too)
+
+    Other camelCase top-level fields pass through unchanged — Xero REST
+    normalizes Type/Date/Status/CurrencyCode/LineAmountTypes/etc. on its
+    own. Returns a new dict (does not mutate input)."""
+    out = dict(data)
+    cid = out.pop("contactId", None) or out.pop("ContactId", None)
+    if cid and "Contact" not in out and "contact" not in out:
+        out["Contact"] = {"ContactID": cid}
+    bid = out.pop("bankAccountId", None) or out.pop("BankAccountId", None)
+    if bid and "BankAccount" not in out and "bankAccount" not in out:
+        out["BankAccount"] = {"AccountID": bid}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# *_full create/update tools — bypass the CLI's field-stripping bug
+# ---------------------------------------------------------------------------
+# The upstream xero-command-line CLI hard-codes the outgoing payload for
+# invoices/credit-notes/quotes/bank-transactions to a small whitelist of
+# fields and silently drops everything else. CurrencyCode, CurrencyRate,
+# Status, DueDate, LineAmountTypes, BrandingThemeID, etc. all go missing.
+# Concrete failure: an ACCREC invoice with currencyCode='USD' lands in the
+# org's base currency (CAD) as DRAFT instead of USD AUTHORISED. Blocks any
+# foreign-currency invoicing.
+#
+# These _full variants POST directly to Xero's REST API with the user's
+# data dict passed through verbatim — no field stripping. Xero REST accepts
+# either camelCase or PascalCase for input, so the data dict can use
+# whichever the caller prefers; we forward it untouched.
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    description=(
+        "[xero-rest sidecar] Create an invoice with FULL Xero REST field "
+        "support — PASSES THROUGH every field in your `data` dict, including "
+        "CurrencyCode, CurrencyRate, Status, DueDate, LineAmountTypes, "
+        "BrandingThemeID, ExpectedPaymentDate, InvoiceNumber, etc.\n"
+        "\n"
+        "USE WHENEVER you need a non-base-currency invoice (USD, EUR, GBP "
+        "in a CAD-base org), need to post as AUTHORISED in one shot (skip "
+        "DRAFT), set a specific due date, or any other field beyond the "
+        "{type, contact, lineItems, date, reference} minimum.\n"
+        "\n"
+        "PREFER THIS over `mcp__xero-cli__invoices_create` whenever currency, "
+        "status, dueDate, or any non-trivial field matters — the CLI version "
+        "silently drops those fields and forces the invoice into the org's "
+        "base currency as DRAFT. The CLI version is fine for the simplest "
+        "AUTHORISED-after-the-fact CAD invoices but not much else.\n"
+        "\n"
+        "Args:\n"
+        "  data: Full Xero invoice payload (dict). Both camelCase and "
+        "PascalCase keys work — Xero REST accepts either. Forwarded verbatim.\n"
+        "  profile: Optional profile override\n"
+        "\n"
+        "Returns the created Invoice object. Pull invoiceID + currencyCode "
+        "+ currencyRate from the response to confirm the currency stuck "
+        "(should be non-1 rate for FX invoices)."
+    )
+)
+async def invoices_create_full(
+    data: dict,
+    profile: str | None = None,
+) -> Any:
+    return await _api(
+        "PUT", "/Invoices",
+        profile=profile,
+        json_body={"Invoices": [_normalize_xero_payload(data)]},
+    )
+
+
+@mcp.tool(
+    description=(
+        "[xero-rest sidecar] Update an invoice with FULL Xero REST field "
+        "support — PASSES THROUGH every field in your `data` dict.\n"
+        "\n"
+        "USE WHENEVER you need to change fields the CLI's invoices_update "
+        "doesn't expose: CurrencyCode, CurrencyRate, Status (e.g., promote "
+        "DRAFT → AUTHORISED), LineAmountTypes, BrandingThemeID, DueDate, etc.\n"
+        "\n"
+        "Args:\n"
+        "  invoice_id: InvoiceID UUID (REQUIRED)\n"
+        "  data: Partial update dict — only fields to change. InvoiceID is "
+        "auto-merged from invoice_id arg; you don't need to repeat it.\n"
+        "  profile: Optional profile override"
+    )
+)
+async def invoices_update_full(
+    invoice_id: str,
+    data: dict,
+    profile: str | None = None,
+) -> Any:
+    body = {**_normalize_xero_payload(data), "InvoiceID": invoice_id}
+    return await _api(
+        "POST", f"/Invoices/{invoice_id}",
+        profile=profile, json_body=body,
+    )
+
+
+@mcp.tool(
+    description=(
+        "[xero-rest sidecar] Create a credit note with FULL Xero REST field "
+        "support — PASSES THROUGH every field in your `data` dict including "
+        "CurrencyCode, Status, Date, DueDate, LineAmountTypes, etc.\n"
+        "\n"
+        "USE WHENEVER you need a foreign-currency credit note or to post as "
+        "AUTHORISED directly. The CLI's credit_notes_create drops the same "
+        "fields invoices_create does.\n"
+        "\n"
+        "Args:\n"
+        "  data: Full Xero credit note payload (Type, Contact, LineItems, "
+        "CurrencyCode, Status, Date, ...). camelCase or PascalCase both work.\n"
+        "  profile: Optional profile override"
+    )
+)
+async def credit_notes_create_full(
+    data: dict,
+    profile: str | None = None,
+) -> Any:
+    return await _api(
+        "PUT", "/CreditNotes",
+        profile=profile,
+        json_body={"CreditNotes": [_normalize_xero_payload(data)]},
+    )
+
+
+@mcp.tool(
+    description=(
+        "[xero-rest sidecar] Create a quote with FULL Xero REST field "
+        "support — PASSES THROUGH every field in your `data` dict including "
+        "CurrencyCode, CurrencyRate, Status, ExpiryDate, BrandingThemeID, etc.\n"
+        "\n"
+        "USE WHENEVER you need a foreign-currency quote or want fields the "
+        "CLI's quotes_create drops.\n"
+        "\n"
+        "Args:\n"
+        "  data: Full Xero quote payload. camelCase or PascalCase both work.\n"
+        "  profile: Optional profile override"
+    )
+)
+async def quotes_create_full(
+    data: dict,
+    profile: str | None = None,
+) -> Any:
+    return await _api(
+        "PUT", "/Quotes",
+        profile=profile,
+        json_body={"Quotes": [_normalize_xero_payload(data)]},
+    )
+
+
+@mcp.tool(
+    description=(
+        "[xero-rest sidecar] Create a bank transaction with FULL Xero REST "
+        "field support — PASSES THROUGH every field in your `data` dict "
+        "including CurrencyCode, CurrencyRate (for foreign-currency txns), "
+        "Status, LineAmountTypes, IsReconciled, etc.\n"
+        "\n"
+        "USE WHENEVER you need a foreign-currency bank transaction (posting "
+        "USD spend on a USD bank account in a CAD-base org), need to pre-"
+        "reconcile, or want any field beyond the CLI's "
+        "{type, bankAccount, contact, lineItems, date, reference} minimum.\n"
+        "\n"
+        "Args:\n"
+        "  data: Full Xero BankTransaction payload (Type, BankAccount, "
+        "Contact, LineItems, Date, CurrencyCode, ...). camelCase or "
+        "PascalCase both work.\n"
+        "  profile: Optional profile override"
+    )
+)
+async def bank_transactions_create_full(
+    data: dict,
+    profile: str | None = None,
+) -> Any:
+    return await _api(
+        "PUT", "/BankTransactions",
+        profile=profile,
+        json_body={"BankTransactions": [_normalize_xero_payload(data)]},
     )
 
 
