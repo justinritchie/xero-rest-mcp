@@ -429,6 +429,9 @@ async def whoami(profile: str | None = None) -> dict:
             "credit_notes_create_full",
             "quotes_create_full",
             "bank_transactions_create_full",
+            # Round 5 — Chart-of-Accounts gap (xero-cli has list+update only)
+            "accounts_create",
+            "accounts_archive",
         ],
     }
 
@@ -931,6 +934,154 @@ async def bank_transactions_create_full(
         "PUT", "/BankTransactions",
         profile=profile,
         json_body={"BankTransactions": [_normalize_xero_payload(data)]},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Accounts — CREATE + ARCHIVE (xero-cli has list + update only; this fills the
+# gap so monthly-close automation can spin up clearing/suspense accounts
+# without a UI step. Filed upstream ticket against the `xero` CLI itself, but
+# don't block on whoever maintains that — this sidecar already exists for
+# exactly this kind of gap.)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    description=(
+        "[xero-rest sidecar] CREATE / ADD / MAKE / NEW / SET-UP / OPEN a "
+        "Xero Chart-of-Accounts entry — wraps PUT /Accounts. Use whenever "
+        "monthly-close automation needs to spin up a fresh GL account "
+        "(clearing/suspense/holding accounts, new expense categories, new "
+        "tracking-cost buckets, etc.) without touching the Xero web UI.\n"
+        "\n"
+        "Fills the xero-cli gap (it has accounts_list + accounts_update but "
+        "NO accounts_create) and is the canonical answer for any 'create a "
+        "new account in the Chart of Accounts' workflow.\n"
+        "\n"
+        "Args:\n"
+        "  code: 1–10 alphanumeric chars, MUST be unique/unused in this org "
+        "(REQUIRED for non-BANK accounts; Xero auto-generates for BANK).\n"
+        "  name: Account display name (REQUIRED).\n"
+        "  account_type: Xero AccountType enum — EXPENSE, REVENUE, "
+        "DIRECTCOSTS, OVERHEADS, CURRENT (current asset), FIXED, INVENTORY, "
+        "PREPAYMENT, CURRLIAB (current liability), LIABILITY, TERMLIAB "
+        "(non-current liability), EQUITY, BANK, SALES, NONCURRENT (REQUIRED). "
+        "Named account_type to avoid shadowing Python's `type` builtin.\n"
+        "  tax_type: Optional TaxType code — e.g. NONE, INPUT, OUTPUT, "
+        "CAN030, EXEMPTEXPENSES. Defaults by account_type per Xero rules.\n"
+        "  description: Optional. NOT permitted when account_type = BANK.\n"
+        "  bank_account_number: REQUIRED if account_type = BANK; ignored "
+        "otherwise.\n"
+        "  bank_account_type: BANK / CREDITCARD / PAYPAL (when BANK).\n"
+        "  currency_code: ISO 4217 — only meaningful for BANK accounts.\n"
+        "  enable_payments_to_account: bool — if True, this account can be "
+        "selected as a payment-destination on customer invoices.\n"
+        "  show_in_expense_claims: bool — exposes account to expense-claim "
+        "submitters.\n"
+        "  add_to_watchlist: bool — pins to the dashboard watchlist.\n"
+        "  profile: Optional profile override.\n"
+        "\n"
+        "Returns the created Account object including AccountID (GUID), "
+        "Class (auto-derived), and Status (ACTIVE).\n"
+        "\n"
+        "Errors to expect:\n"
+        "  - Duplicate Code → Xero 400 'Please enter a unique Code' verbatim.\n"
+        "  - Invalid Type/TaxType combo → 400 with field-level details.\n"
+        "  - BANK without BankAccountNumber → 400.\n"
+        "  - Description on BANK → 400 (Xero rejects).\n"
+        "\n"
+        "Use INSTEAD of: xero-cli's accounts_update (which can only modify "
+        "existing accounts), or manual UI creation. NOT for: archiving "
+        "(accounts_archive), bulk import (use Xero's CSV importer)."
+    )
+)
+async def accounts_create(
+    code: str | None = None,
+    name: str = "",
+    account_type: str = "",
+    tax_type: str | None = None,
+    description: str | None = None,
+    bank_account_number: str | None = None,
+    bank_account_type: str | None = None,
+    currency_code: str | None = None,
+    enable_payments_to_account: bool | None = None,
+    show_in_expense_claims: bool | None = None,
+    add_to_watchlist: bool | None = None,
+    profile: str | None = None,
+) -> Any:
+    if not name:
+        return _err("accounts_create", ValueError("`name` is required"))
+    if not account_type:
+        return _err("accounts_create", ValueError("`account_type` is required (e.g. EXPENSE, BANK, CURRLIAB)"))
+    body: dict[str, Any] = {"Name": name, "Type": account_type.upper()}
+    if code is not None:
+        body["Code"] = str(code)
+    elif account_type.upper() != "BANK":
+        return _err("accounts_create", ValueError("`code` is required for non-BANK account types"))
+    if tax_type is not None:
+        body["TaxType"] = tax_type
+    if description is not None:
+        if account_type.upper() == "BANK":
+            return _err("accounts_create", ValueError("`description` is not permitted on BANK accounts (Xero rule)"))
+        body["Description"] = description
+    if account_type.upper() == "BANK":
+        if not bank_account_number:
+            return _err("accounts_create", ValueError("`bank_account_number` is required when account_type=BANK"))
+        body["BankAccountNumber"] = bank_account_number
+        if bank_account_type is not None:
+            body["BankAccountType"] = bank_account_type.upper()
+        if currency_code is not None:
+            body["CurrencyCode"] = currency_code.upper()
+    for k, v in {
+        "EnablePaymentsToAccount": enable_payments_to_account,
+        "ShowInExpenseClaims": show_in_expense_claims,
+        "AddToWatchlist": add_to_watchlist,
+    }.items():
+        if v is not None:
+            body[k] = v
+    return await _api("PUT", "/Accounts", profile=profile, json_body=body)
+
+
+@mcp.tool(
+    description=(
+        "[xero-rest sidecar] ARCHIVE / DEACTIVATE / RETIRE / DEPRECATE / "
+        "HIDE / SUNSET a Xero Chart-of-Accounts entry — wraps POST "
+        "/Accounts/{AccountID} with `Status=ARCHIVED`. Xero does NOT delete "
+        "accounts via API (or via UI) once they've had activity; "
+        "deactivation is the canonical retire path. After archival the "
+        "account is hidden from drop-downs and reports but historical "
+        "postings remain queryable.\n"
+        "\n"
+        "Use this when: cleaning up the Chart of Accounts after a "
+        "reorganization, retiring an old clearing account that's been zeroed "
+        "out, sunsetting a tracking bucket that's no longer used. The "
+        "symmetric companion to accounts_create.\n"
+        "\n"
+        "Args:\n"
+        "  account_id: Xero AccountID GUID (the canonical identifier; e.g. "
+        "'00000000-0000-0000-0000-000000000000'). To retrieve, use xero-cli "
+        "accounts_list and grab the AccountID field.\n"
+        "  profile: Optional profile override.\n"
+        "\n"
+        "Returns the updated Account object with Status=ARCHIVED. To restore "
+        "later: call xero-cli's accounts_update with Status=ACTIVE.\n"
+        "\n"
+        "NOT for: deleting accounts with historical postings (impossible; "
+        "Xero preserves audit trail), removing accounts pre-activity (use "
+        "the Xero UI's delete option), or full account replacement (create "
+        "the new one, archive the old, manually re-route any active "
+        "subscriptions/templates/rules)."
+    )
+)
+async def accounts_archive(
+    account_id: str,
+    profile: str | None = None,
+) -> Any:
+    if not account_id:
+        return _err("accounts_archive", ValueError("`account_id` is required"))
+    return await _api(
+        "POST", f"/Accounts/{account_id}",
+        profile=profile,
+        json_body={"Status": "ARCHIVED"},
     )
 
 
